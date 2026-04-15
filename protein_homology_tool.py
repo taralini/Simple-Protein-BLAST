@@ -206,7 +206,8 @@ def align_sequences(query: SequenceRecord, subject: SequenceRecord, mode: str = 
 aligned_query, aligned_subject = _aligned_strings_from_alignment(
     alignment,
     query.sequence,
-    subject.sequence,)
+    subject.sequence,
+)
 
     matrix = aligner.substitution_matrix
     middle = "".join(_middle_char(a, b, matrix) for a, b in zip(aligned_query, aligned_subject))
