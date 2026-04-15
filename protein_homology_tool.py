@@ -169,27 +169,45 @@ def _middle_char(a: str, b: str, matrix) -> str:
     return " "
 
 
-def _aligned_strings_from_alignment(alignment) -> Tuple[str, str]:
-    rendered = str(alignment).splitlines()
-    if len(rendered) < 3:
-        raise RuntimeError("Unexpected Biopython alignment rendering")
+def _aligned_strings_from_alignment(alignment, query_seq: str, subject_seq: str) -> Tuple[str, str]:
+    query_parts = []
+    subject_parts = []
 
-    target_line = rendered[0]
-    query_line = rendered[2]
+    q_blocks = alignment.coordinates[0]
+    s_blocks = alignment.coordinates[1]
 
-    target_match = re.search(r"\d+\s+([A-Z\-]+)\s+\d+", target_line)
-    query_match = re.search(r"\d+\s+([A-Z\-]+)\s+\d+", query_line)
-    if not target_match or not query_match:
-        raise RuntimeError("Could not parse aligned strings")
+    for i in range(len(q_blocks) - 1):
+        q_start, q_end = q_blocks[i], q_blocks[i + 1]
+        s_start, s_end = s_blocks[i], s_blocks[i + 1]
 
-    return target_match.group(1), query_match.group(1)
+        q_len = q_end - q_start
+        s_len = s_end - s_start
+
+        if q_len == s_len:
+            query_parts.append(query_seq[q_start:q_end])
+            subject_parts.append(subject_seq[s_start:s_end])
+        elif q_len > 0 and s_len == 0:
+            query_parts.append(query_seq[q_start:q_end])
+            subject_parts.append("-" * q_len)
+        elif s_len > 0 and q_len == 0:
+            query_parts.append("-" * s_len)
+            subject_parts.append(subject_seq[s_start:s_end])
+        else:
+            raise RuntimeError(
+                f"Unexpected alignment block: query {q_start}-{q_end}, subject {s_start}-{s_end}"
+            )
+
+    return "".join(query_parts), "".join(subject_parts)
 
 
 def align_sequences(query: SequenceRecord, subject: SequenceRecord, mode: str = "local") -> AlignmentResult:
     aligner = build_aligner(mode)
     alignment = aligner.align(query.sequence, subject.sequence)[0]
-    aligned_query, aligned_subject = _aligned_strings_from_alignment(alignment)
-
+aligned_query, aligned_subject = _aligned_strings_from_alignment(
+    alignment,
+    query.sequence,
+    subject.sequence,
+)
     matrix = aligner.substitution_matrix
     middle = "".join(_middle_char(a, b, matrix) for a, b in zip(aligned_query, aligned_subject))
 
