@@ -203,6 +203,7 @@ def _aligned_strings_from_alignment(alignment, query_seq: str, subject_seq: str)
 def align_sequences(query: SequenceRecord, subject: SequenceRecord, mode: str = "local") -> AlignmentResult:
     aligner = build_aligner(mode)
     alignment = aligner.align(query.sequence, subject.sequence)[0]
+    
 aligned_query, aligned_subject = _aligned_strings_from_alignment(
     alignment,
     query.sequence,
