@@ -1,4 +1,4 @@
 # requirements
-streamlit==1.44.1
-biopython==1.84
-requests==2.32.3
+streamlit
+biopython
+requests
