@@ -1,1 +1,4 @@
-# Simple-Protein-BLAST
+# requirements
+streamlit
+biopython
+requests
