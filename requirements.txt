@@ -2,3 +2,4 @@
 streamlit
 biopython
 requests
+pandas
