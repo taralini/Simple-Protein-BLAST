@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import pandas as pd
 import requests
 import streamlit as st
 from Bio import Align
@@ -22,6 +23,11 @@ class SequenceRecord:
     identifier: str
     description: str
     sequence: str
+    entry_name: str = ""
+    protein_name: str = ""
+    organism: str = ""
+    reviewed: Optional[bool] = None
+    length: Optional[int] = None
 
 
 @dataclass
@@ -71,6 +77,30 @@ def clean_sequence(text: str) -> str:
     return seq
 
 
+def _parse_fasta_header(header: str) -> Tuple[str, str, str, str, bool]:
+    accession = ""
+    entry_name = ""
+    protein_name = ""
+    organism = ""
+    reviewed = None
+
+    parts = header.split("|", 2)
+    if len(parts) >= 3:
+        db_code, accession, rest = parts[0], parts[1], parts[2]
+        reviewed = db_code == "sp"
+        first_token, _, remainder = rest.partition(" ")
+        entry_name = first_token.strip()
+        protein_name = remainder.split(" OS=")[0].strip() if remainder else ""
+        os_match = re.search(r" OS=(.+?)(?: OX=| GN=| PE=| SV=|$)", remainder)
+        if os_match:
+            organism = os_match.group(1).strip()
+    else:
+        accession = header.split()[0]
+        protein_name = header
+
+    return accession, entry_name, protein_name, organism, reviewed
+
+
 def fetch_uniprot_by_accession(accession: str, timeout: int = 30) -> SequenceRecord:
     accession = accession.strip()
     fasta_url = f"{UNIPROT_BASE}/uniprotkb/{accession}.fasta"
@@ -78,7 +108,8 @@ def fetch_uniprot_by_accession(accession: str, timeout: int = 30) -> SequenceRec
     if response.status_code == 404:
         raise UniProtError(f"UniProt accession not found: {accession}")
     response.raise_for_status()
-    return parse_fasta_record(response.text, source="UniProt", identifier=accession)
+    record = parse_fasta_record(response.text, source="UniProt", identifier=accession)
+    return record
 
 
 @st.cache_data(show_spinner=False)
@@ -123,13 +154,19 @@ def parse_fasta_records(fasta_text: str, source: str) -> List[SequenceRecord]:
         lines = chunk.splitlines()
         header = lines[0].strip()
         seq = clean_sequence("\n".join(lines[1:]))
-        identifier = header.split()[0]
+        accession, entry_name, protein_name, organism, reviewed = _parse_fasta_header(header)
+        identifier = accession or header.split()[0]
         records.append(
             SequenceRecord(
                 source=source,
                 identifier=identifier,
                 description=header,
                 sequence=seq,
+                entry_name=entry_name,
+                protein_name=protein_name,
+                organism=organism,
+                reviewed=reviewed,
+                length=len(seq),
             )
         )
     return records
@@ -170,15 +207,15 @@ def _middle_char(a: str, b: str, matrix) -> str:
 
 
 def _aligned_strings_from_alignment(alignment, query_seq: str, subject_seq: str) -> Tuple[str, str]:
-    query_parts = []
-    subject_parts = []
+    query_parts: List[str] = []
+    subject_parts: List[str] = []
 
     q_blocks = alignment.coordinates[0]
     s_blocks = alignment.coordinates[1]
 
     for i in range(len(q_blocks) - 1):
-        q_start, q_end = q_blocks[i], q_blocks[i + 1]
-        s_start, s_end = s_blocks[i], s_blocks[i + 1]
+        q_start, q_end = int(q_blocks[i]), int(q_blocks[i + 1])
+        s_start, s_end = int(s_blocks[i]), int(s_blocks[i + 1])
 
         q_len = q_end - q_start
         s_len = s_end - s_start
@@ -198,6 +235,7 @@ def _aligned_strings_from_alignment(alignment, query_seq: str, subject_seq: str)
             )
 
     return "".join(query_parts), "".join(subject_parts)
+
 
 def align_sequences(query: SequenceRecord, subject: SequenceRecord, mode: str = "local") -> AlignmentResult:
     aligner = build_aligner(mode)
@@ -288,6 +326,43 @@ def format_alignment(result: AlignmentResult, width: int = 60) -> str:
     return "\n".join(lines)
 
 
+def build_uniprot_query(
+    accession: str = "",
+    gene: str = "",
+    species: str = "",
+    protein_name: str = "",
+    reviewed_only: bool = True,
+    isoform_only: bool = False,
+) -> str:
+    parts: List[str] = []
+
+    accession = accession.strip()
+    gene = gene.strip()
+    species = species.strip()
+    protein_name = protein_name.strip()
+
+    if accession:
+        parts.append(f"accession:{accession}")
+    if gene:
+        parts.append(f"gene:{gene}")
+    if species:
+        if species.isdigit():
+            parts.append(f"organism_id:{species}")
+        else:
+            parts.append(f'organism_name:"{species}"')
+    if protein_name:
+        parts.append(f'protein_name:"{protein_name}"')
+    if reviewed_only:
+        parts.append("reviewed:true")
+    if isoform_only:
+        parts.append("is_isoform:true")
+
+    if not parts:
+        raise ValueError("Provide at least one search field or use accession/raw sequence mode.")
+
+    return " AND ".join(parts)
+
+
 def resolve_sequence(input_value: str, kind: str, reviewed_only: bool = True) -> SequenceRecord:
     if kind == "accession":
         return fetch_uniprot_by_accession(input_value)
@@ -295,67 +370,143 @@ def resolve_sequence(input_value: str, kind: str, reviewed_only: bool = True) ->
         return search_uniprot(input_value, size=1, reviewed=reviewed_only)[0]
     if kind == "sequence":
         sequence = clean_sequence(input_value)
-        return SequenceRecord(source="input", identifier="custom", description="custom input", sequence=sequence)
+        return SequenceRecord(
+            source="input",
+            identifier="custom",
+            description="custom input",
+            sequence=sequence,
+            protein_name="custom input",
+            organism="",
+            reviewed=None,
+            length=len(sequence),
+        )
     raise ValueError("kind must be accession, query, or sequence")
-
-
-def preview_search_results(query: str, reviewed_only: bool) -> List[SequenceRecord]:
-    return search_uniprot(query, size=5, reviewed=reviewed_only)
-
-
-def input_panel(title: str, prefix: str) -> Tuple[str, str, bool]:
-    st.subheader(title)
-    kind = st.radio(
-        "Input type",
-        options=["accession", "query", "sequence"],
-        horizontal=True,
-        key=f"{prefix}_kind",
-    )
-
-    if kind == "accession":
-        value = st.text_input(
-            "UniProt accession",
-            placeholder="Example: P69905",
-            key=f"{prefix}_value",
-        )
-    elif kind == "query":
-        value = st.text_area(
-            "UniProt search query",
-            placeholder="Example: gene:HBB AND organism_id:9606",
-            height=100,
-            key=f"{prefix}_value",
-        )
-    else:
-        value = st.text_area(
-            "Protein sequence or FASTA",
-            placeholder=">example\nMVLSPADKTNVKAA...",
-            height=180,
-            key=f"{prefix}_value",
-        )
-
-    reviewed_only = st.checkbox(
-        "Reviewed entries only (Swiss-Prot)",
-        value=True,
-        key=f"{prefix}_reviewed",
-        disabled=(kind != "query"),
-    )
-
-    return kind, value, reviewed_only
 
 
 def render_record_card(record: SequenceRecord, label: str) -> None:
     st.markdown(f"**{label}**")
-    st.caption(record.description)
+    if record.protein_name:
+        st.write(record.protein_name)
+    meta = []
+    if record.identifier:
+        meta.append(f"Accession: {record.identifier}")
+    if record.entry_name:
+        meta.append(f"Entry: {record.entry_name}")
+    if record.organism:
+        meta.append(f"Organism: {record.organism}")
+    if record.reviewed is not None:
+        meta.append("Reviewed" if record.reviewed else "Unreviewed")
+    if record.length:
+        meta.append(f"Length: {record.length} aa")
+    if meta:
+        st.caption(" | ".join(meta))
     st.code(record.sequence[:1200] + ("..." if len(record.sequence) > 1200 else ""), language=None)
-    st.write(f"Length: {len(record.sequence)} aa")
+
+
+def search_selector_panel(title: str, prefix: str) -> Tuple[str, str, bool, Optional[SequenceRecord]]:
+    st.subheader(title)
+    mode = st.radio(
+        "Input mode",
+        options=["Structured search", "Accession", "Raw sequence", "Advanced query"],
+        horizontal=True,
+        key=f"{prefix}_mode",
+    )
+
+    selected_record: Optional[SequenceRecord] = None
+    resolved_kind = ""
+    resolved_value = ""
+    reviewed_only = True
+
+    if mode == "Structured search":
+        gene = st.text_input("Gene", key=f"{prefix}_gene", placeholder="TP53")
+        species = st.text_input("Species or taxonomy ID", key=f"{prefix}_species", placeholder="Homo sapiens or 9606")
+        protein_name = st.text_input("Protein name (optional)", key=f"{prefix}_protein", placeholder="cellular tumor antigen p53")
+        reviewed_only = st.checkbox("Reviewed only", value=True, key=f"{prefix}_reviewed_structured")
+        isoform_only = st.checkbox("Isoform entries only", value=False, key=f"{prefix}_isoform")
+        max_hits = st.slider("Search results", min_value=3, max_value=10, value=5, key=f"{prefix}_max_hits")
+
+        search_clicked = st.button(f"Search {title}", key=f"{prefix}_search_button")
+        if search_clicked:
+            try:
+                query = build_uniprot_query(
+                    gene=gene,
+                    species=species,
+                    protein_name=protein_name,
+                    reviewed_only=reviewed_only,
+                    isoform_only=isoform_only,
+                )
+                records = search_uniprot(query, size=max_hits, reviewed=None)
+                st.session_state[f"{prefix}_records"] = records
+                st.session_state[f"{prefix}_query_string"] = query
+            except Exception as exc:
+                st.error(str(exc))
+
+        records = st.session_state.get(f"{prefix}_records", [])
+        if records:
+            options = []
+            for idx, rec in enumerate(records):
+                label = f"{idx + 1}. {rec.identifier} | {rec.organism or 'Unknown organism'} | {rec.protein_name or rec.description[:50]}"
+                options.append(label)
+
+            selected_label = st.selectbox(
+                "Choose a UniProt hit",
+                options=options,
+                key=f"{prefix}_selectbox",
+            )
+            selected_index = options.index(selected_label)
+            selected_record = records[selected_index]
+            resolved_kind = "accession"
+            resolved_value = selected_record.identifier
+
+            df = pd.DataFrame(
+                [
+                    {
+                        "Accession": rec.identifier,
+                        "Entry": rec.entry_name,
+                        "Protein": rec.protein_name,
+                        "Organism": rec.organism,
+                        "Reviewed": "Yes" if rec.reviewed else "No",
+                        "Length": rec.length,
+                    }
+                    for rec in records
+                ]
+            )
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    elif mode == "Accession":
+        resolved_kind = "accession"
+        resolved_value = st.text_input("UniProt accession", key=f"{prefix}_accession", placeholder="P04637")
+        reviewed_only = True
+
+    elif mode == "Raw sequence":
+        resolved_kind = "sequence"
+        resolved_value = st.text_area(
+            "Protein sequence or FASTA",
+            key=f"{prefix}_sequence",
+            placeholder=">example\nMEEPQSDPSVEPPLSQETFSDLWKLL...",
+            height=180,
+        )
+        reviewed_only = True
+
+    else:
+        resolved_kind = "query"
+        resolved_value = st.text_area(
+            "UniProt query",
+            key=f"{prefix}_advanced_query",
+            placeholder="gene:TP53 AND organism_id:9606 AND reviewed:true",
+            height=100,
+        )
+        reviewed_only = st.checkbox("Reviewed only", value=True, key=f"{prefix}_reviewed_advanced")
+
+    return resolved_kind, resolved_value, reviewed_only, selected_record
 
 
 def main() -> None:
     st.set_page_config(page_title="Protein Homology Tool", layout="wide")
-    st.title("Protein Homology Tool")
+    st.title("Protein Homology Tool - Version 2 Draft")
     st.write(
-        "Compare two protein sequences using UniProt retrieval plus BLAST-like pairwise alignment output. "
-        "Use local alignment for best-region matching or global alignment for full-length comparison."
+        "Compare proteins across species, within-species variants, and candidate orthologs using UniProt retrieval "
+        "and BLAST-like pairwise alignment output."
     )
 
     with st.sidebar:
@@ -369,37 +520,16 @@ def main() -> None:
         width = st.slider("Alignment line width", min_value=40, max_value=120, value=60, step=10)
         st.markdown("---")
         st.markdown(
-            "**Notes**\n"
-            "- Percent homology is usually reported as percent identity or similarity.\n"
-            "- This app performs pairwise alignment, not a full BLAST database search."
+            "**Suggested usage**\n"
+            "- Across species orthologs: start with local and inspect coverage.\n"
+            "- Isoforms or variants within one species: global is often more informative."
         )
 
     left, right = st.columns(2)
     with left:
-        query_kind, query_value, query_reviewed = input_panel("Query protein", "query")
+        query_kind, query_value, query_reviewed, query_selected = search_selector_panel("Query protein", "query")
     with right:
-        subject_kind, subject_value, subject_reviewed = input_panel("Subject protein", "subject")
-
-    preview_col1, preview_col2 = st.columns(2)
-    with preview_col1:
-        if query_kind == "query" and query_value.strip() and st.button("Preview query matches"):
-            try:
-                records = preview_search_results(query_value, query_reviewed)
-                for i, rec in enumerate(records, start=1):
-                    st.markdown(f"**{i}. {rec.identifier}**")
-                    st.caption(rec.description)
-            except Exception as exc:
-                st.error(str(exc))
-
-    with preview_col2:
-        if subject_kind == "query" and subject_value.strip() and st.button("Preview subject matches"):
-            try:
-                records = preview_search_results(subject_value, subject_reviewed)
-                for i, rec in enumerate(records, start=1):
-                    st.markdown(f"**{i}. {rec.identifier}**")
-                    st.caption(rec.description)
-            except Exception as exc:
-                st.error(str(exc))
+        subject_kind, subject_value, subject_reviewed, subject_selected = search_selector_panel("Subject protein", "subject")
 
     if st.button("Run alignment", type="primary"):
         try:
@@ -407,8 +537,8 @@ def main() -> None:
                 raise ValueError("Both query and subject inputs are required.")
 
             with st.spinner("Resolving sequences and running alignment..."):
-                query_record = resolve_sequence(query_value, query_kind, reviewed_only=query_reviewed)
-                subject_record = resolve_sequence(subject_value, subject_kind, reviewed_only=subject_reviewed)
+                query_record = query_selected or resolve_sequence(query_value, query_kind, reviewed_only=query_reviewed)
+                subject_record = subject_selected or resolve_sequence(subject_value, subject_kind, reviewed_only=subject_reviewed)
                 result = align_sequences(query_record, subject_record, mode=mode)
                 alignment_text = format_alignment(result, width=width)
 
@@ -429,6 +559,25 @@ def main() -> None:
             metric_cols[4].metric("Query coverage", f"{s.query_coverage:.2f}%")
             metric_cols[5].metric("Subject coverage", f"{s.subject_coverage:.2f}%")
 
+            summary_df = pd.DataFrame(
+                [
+                    {
+                        "Query accession": query_record.identifier,
+                        "Query organism": query_record.organism,
+                        "Subject accession": subject_record.identifier,
+                        "Subject organism": subject_record.organism,
+                        "Mode": s.alignment_type,
+                        "% Identity": round(s.percent_identity, 2),
+                        "% Positive": round(s.percent_positive, 2),
+                        "Query coverage": round(s.query_coverage, 2),
+                        "Subject coverage": round(s.subject_coverage, 2),
+                        "Score": round(s.score, 2),
+                    }
+                ]
+            )
+            st.subheader("Comparison summary")
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
             st.subheader("BLAST-like alignment")
             st.code(alignment_text, language=None)
 
@@ -437,6 +586,12 @@ def main() -> None:
                 data=alignment_text,
                 file_name="protein_alignment.txt",
                 mime="text/plain",
+            )
+            st.download_button(
+                "Download summary CSV",
+                data=summary_df.to_csv(index=False),
+                file_name="protein_alignment_summary.csv",
+                mime="text/csv",
             )
 
         except Exception as exc:
